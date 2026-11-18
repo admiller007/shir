@@ -73,9 +73,21 @@ In a test on 24 Hebrew songs written the way Spotify shows them (21 in LRCLIB, 3
 
 In a separate test, 12 of 76 translated lines were deliberately corrupted. Jev's check flagged all 12, and it falsely flagged 1 of the 64 correct lines.
 
+## Learn from the songs you love
+
+Listening is where Hebrew sticks, so Shir turns your Spotify into a course:
+
+- **☆ Save a line** while it plays (or press `s`). It goes into your deck.
+- **אב Word by word**: tap it on any line to see each word's meaning, pronunciation, dictionary form (`לאהוב`, not `אהבתי`), and a short grammar note. Each line is looked up once, then cached.
+- **★ Deck** (or `d`): spaced-repetition review of your saved lines. Each card **plays that exact line from the real song in Spotify** and pauses when the line ends. Say what it means, press `enter` to check, then `1` *Again* or `2` *Got it*. Lines you know come back less often (1, 3, 7, 16, 35, then 90 days).
+
+Your deck lives in `~/.shir/deck.json`. Word breakdowns cost about as much as translating one line.
+
 ## Keyboard
 
-`space` play/pause · `←` `→` previous/next · `h` `t` `e` show/hide Hebrew, transliteration, English · **A− / A+** text size
+`space` play/pause · `←` `→` previous/next · `h` `t` `e` show/hide Hebrew, transliteration, English · `s` save the current line · `w` word by word · `d` deck · **A− / A+** text size
+
+In review: `space` hear it again · `enter` show meaning · `1` again · `2` got it · `esc` close
 
 ## Options
 
@@ -95,7 +107,7 @@ Other commands:
 
 ## Privacy
 
-Shir runs locally on your Mac. The only things that leave it are lyrics searches (to LRCLIB and lyrics.ovh) and the song's title, artist, and lyrics (to OpenRouter, for translation and Jev). Your API key stays in `~/.shir/config.json`.
+Shir runs locally on your Mac and only answers requests from your own machine. The only things that leave it are lyrics searches (to LRCLIB and lyrics.ovh) and the song's title, artist, and lyrics (to OpenRouter, for translation and Jev). Your API key stays in `~/.shir/config.json`.
 
 Lyrics are copyrighted by their authors. Shir is meant for personal listening.
 
