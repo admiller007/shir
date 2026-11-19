@@ -35,7 +35,7 @@ from pathlib import Path
 HOME = Path.home() / ".shir"
 CACHE = HOME / "cache"
 PORT = 5799
-VERSION = "1.9"
+VERSION = "2.0"
 UA = "Shir/1.0 (personal lyrics viewer)"
 
 # ----------------------------------------------------------------------------- config
@@ -137,9 +137,23 @@ class SpotifyPlayer:
         cmds = {
             "seek": f"set player position to {float(value):.2f}",
             "playpause": "playpause", "next": "next track", "previous": "previous track",
+            "pause": "pause",
         }
         if action in cmds:
             osa(f'tell application "Spotify" to {cmds[action]}')
+
+    def play_at(self, uri, start):
+        """Play a specific track from a given second (used to replay a saved line)."""
+        if not re.fullmatch(r"spotify:[a-z]+:[A-Za-z0-9]+", uri or ""):
+            raise ValueError("not a Spotify track")
+        osa(f'''tell application "Spotify"
+  if (id of current track) is not "{uri}" then
+    play track "{uri}"
+    delay 0.4
+  end if
+  set player position to {float(start):.2f}
+  play
+end tell''')
 
 
 class DemoPlayer:
@@ -173,6 +187,14 @@ class DemoPlayer:
                 self.paused_at = None
             else:
                 self.paused_at = time.time()
+        elif action == "pause" and not self.paused_at:
+            self.paused_at = time.time()
+
+    def play_at(self, uri, start):
+        if uri != self.t["id"]:
+            raise ValueError("the demo player only has one song")
+        self.paused_at = None
+        self.start = time.time() - float(start)
 
 
 PLAYER = None
@@ -632,6 +654,144 @@ def lyrics_for(track, force_cand=None, refresh=False, pasted=None):
         return res
     return {"status": "working", "stage": job["stage"]}
 
+# ----------------------------------------------------------------------------- learning: word breakdown
+# Tap a line to see it word by word. One small LLM call per line, cached forever.
+
+WORDS = HOME / "words.json"
+WORDS_LOCK = threading.Lock()
+
+WORDS_SYS = """You help an English speaker learning Hebrew understand one line of a song.
+Split the Hebrew line into its words, in order (keep prefixes like ו/ה/ב/ש/ל/מ/כ attached, as written).
+For each word give:
+  "he": the word exactly as written in the line
+  "tr": transliteration as an Israeli would say it ("ch" for ח/כ, "tz" for צ)
+  "en": its meaning in this line (short)
+  "base": the dictionary form (verb: infinitive, e.g. "לאהוב"; noun/adjective: masculine singular), "" if same as the word
+  "note": a very short grammar note when useful, e.g. "past, 1st person sing.", "ש = that + ...", slang meaning; else ""
+Reply as JSON: {"words": [{"he": "...", "tr": "...", "en": "...", "base": "...", "note": "..."}]}"""
+
+
+def word_breakdown(he, en="", song=""):
+    with WORDS_LOCK:
+        cache = json.loads(WORDS.read_text()) if WORDS.exists() else {}
+    if he in cache:
+        return cache[he]
+    if not CFG["deepseek_api_key"]:
+        raise RuntimeError("Add an API key to ~/.shir/config.json to see word breakdowns.")
+    r = llm_json(WORDS_SYS, json.dumps({"song": song, "line": he, "line_translation": en}, ensure_ascii=False),
+                 timeout=40)
+    words = [{k: str(w.get(k) or "").strip() for k in ("he", "tr", "en", "base", "note")}
+             for w in (r.get("words") or []) if isinstance(w, dict) and w.get("he")]
+    if not words:
+        raise RuntimeError("No breakdown came back. Try again.")
+    with WORDS_LOCK:
+        cache = json.loads(WORDS.read_text()) if WORDS.exists() else {}
+        cache[he] = words
+        HOME.mkdir(parents=True, exist_ok=True)
+        WORDS.write_text(json.dumps(cache, ensure_ascii=False))
+    return words
+
+# ----------------------------------------------------------------------------- learning: the deck
+# Star a line while you listen; review it later with spaced repetition. Reviewing plays that exact
+# line of the real song in Spotify, then pauses, so every flashcard has its own audio for free.
+
+DECK = HOME / "deck.json"
+DECK_LOCK = threading.Lock()
+INTERVALS = [0, 1, 3, 7, 16, 35, 90]  # days until the next review, by box (Leitner)
+DAY = 86400
+
+
+def deck_load():
+    try:
+        return json.loads(DECK.read_text()) if DECK.exists() else []
+    except Exception as e:
+        print(f"! could not read {DECK}: {e}")
+        return []
+
+
+def deck_save(cards):
+    HOME.mkdir(parents=True, exist_ok=True)
+    tmp = DECK.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cards, ensure_ascii=False, indent=1))
+    tmp.replace(DECK)
+
+
+def card_id(track_id, he):
+    import hashlib
+    return hashlib.sha1(f"{track_id}\n{he}".encode()).hexdigest()[:12]
+
+
+def deck_add(c):
+    he = (c.get("he") or "").strip()
+    tr = c.get("track") or {}
+    if not he or not tr.get("id"):
+        raise ValueError("need a line and a track")
+    cid = card_id(tr["id"], he)
+    num_or_none = lambda v: None if v is None else float(v)
+    card = {
+        "id": cid, "he": he, "tr": c.get("tr") or "", "en": c.get("en") or "",
+        "t": num_or_none(c.get("t")), "end": num_or_none(c.get("end")),
+        "track": {k: tr.get(k) or "" for k in ("id", "title", "artist", "artwork")},
+        "added": time.time(), "box": 0, "due": time.time(), "reviews": 0, "lapses": 0,
+    }
+    with DECK_LOCK:
+        cards = deck_load()
+        if not any(x["id"] == cid for x in cards):
+            cards.append(card)
+            deck_save(cards)
+    return card
+
+
+def deck_remove(cid):
+    with DECK_LOCK:
+        cards = deck_load()
+        deck_save([c for c in cards if c["id"] != cid])
+
+
+def deck_grade(cid, good):
+    with DECK_LOCK:
+        cards = deck_load()
+        for c in cards:
+            if c["id"] == cid:
+                c["reviews"] += 1
+                if good:
+                    c["box"] = min(c["box"] + 1, len(INTERVALS) - 1)
+                    c["due"] = time.time() + INTERVALS[c["box"]] * DAY
+                else:
+                    c["lapses"] += 1
+                    c["box"] = 0
+                    c["due"] = time.time() + 60  # see it again later this session
+                deck_save(cards)
+                return c
+    raise KeyError("no such card")
+
+
+def deck_view():
+    cards = deck_load()
+    t = time.time()
+    due = sorted((c for c in cards if c["due"] <= t), key=lambda c: (c["due"], c["box"]))
+    upcoming = [c["due"] for c in cards if c["due"] > t]
+    return {"cards": cards, "due": [c["id"] for c in due], "total": len(cards),
+            "learned": sum(1 for c in cards if c["box"] >= 3),
+            "next_due_in": round(min(upcoming) - t) if upcoming else None}
+
+
+PLAY_GEN = [0]  # newest line-playback request; older auto-pause timers check it and stand down
+
+
+def play_line(uri, start, end):
+    PLAY_GEN[0] += 1
+    gen = PLAY_GEN[0]
+    PLAYER.play_at(uri, max(0.0, float(start) - 0.25))
+    if end is not None and float(end) > float(start):
+        def stop():
+            if PLAY_GEN[0] != gen:
+                return
+            now = PLAYER.now()
+            if now.get("id") == uri and now.get("state") == "playing":
+                PLAYER.control("pause")
+        threading.Timer(min(float(end) - float(start), 20) + 0.35, stop).start()
+
 # ----------------------------------------------------------------------------- web server
 
 class Handler(BaseHTTPRequestHandler):
@@ -651,6 +811,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
         q = dict(urllib.parse.parse_qsl(u.query))
+        if self.foreign():
+            return self.send(403, {"error": "forbidden"})
         try:
             if u.path == "/":
                 return self.send(200, PAGE, "text/html")
@@ -667,13 +829,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {"translation": bool(CFG["deepseek_api_key"]),
                                        "jev": jev_on(),
                                        "model": CFG["llm_model"]})
+            if u.path == "/api/deck":
+                return self.send(200, deck_view())
             self.send(404, {"error": "not found"})
         except Exception as e:
             traceback.print_exc()
             self.send(500, {"error": str(e)})
 
+    def foreign(self):
+        """Block other websites (and DNS-rebinding tricks) from driving Spotify or spending API credits."""
+        host = (self.headers.get("Host") or "").split(":")[0]
+        origin = self.headers.get("Origin")
+        ok_hosts = ("127.0.0.1", "localhost")
+        return host not in ok_hosts or (origin and urllib.parse.urlparse(origin).hostname not in ok_hosts)
+
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
+        if self.foreign():
+            return self.send(403, {"error": "forbidden"})
         try:
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
@@ -686,6 +859,19 @@ class Handler(BaseHTTPRequestHandler):
                 if not now.get("id") or not text:
                     return self.send(400, {"error": "nothing playing or no text"})
                 return self.send(200, lyrics_for(now, pasted=text[:20000]))
+            if u.path == "/api/words":
+                return self.send(200, {"words": word_breakdown(body.get("he") or "", body.get("en") or "",
+                                                               body.get("song") or "")})
+            if u.path == "/api/deck/add":
+                return self.send(200, deck_add(body))
+            if u.path == "/api/deck/remove":
+                deck_remove(body.get("id"))
+                return self.send(200, {"ok": True})
+            if u.path == "/api/deck/grade":
+                return self.send(200, deck_grade(body.get("id"), bool(body.get("good"))))
+            if u.path == "/api/playline":
+                play_line(body.get("uri"), body.get("t") or 0, body.get("end"))
+                return self.send(200, {"ok": True})
             self.send(404, {"error": "not found"})
         except Exception as e:
             self.send(500, {"error": str(e)})
@@ -748,13 +934,59 @@ footer{position:fixed;bottom:0;left:0;right:0;z-index:3;display:flex;gap:8px;ali
   padding:12px 16px;background:linear-gradient(0deg,rgba(10,9,14,.9),rgba(10,9,14,0));font-size:12px;color:var(--dim)}
 footer .grow{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 footer a{color:var(--dim);cursor:pointer;text-decoration:underline}
-#picker{position:fixed;z-index:5;inset:auto 12px 56px 12px;max-height:60vh;overflow:auto;
+#picker{position:fixed;z-index:7;inset:auto 12px 56px 12px;max-height:60vh;overflow:auto;
   background:rgba(24,22,30,.97);border:1px solid var(--faint);border-radius:14px;padding:8px;display:none}
 #picker.open{display:block}
 #picker .c{padding:10px;border-radius:9px;cursor:pointer}
 #picker .c:hover{background:rgba(255,255,255,.07)}
 #picker .c b{font-size:14px}
 #picker .c div{font-size:12px;color:var(--dim);margin-top:3px;direction:rtl;text-align:left;unicode-bidi:plaintext}
+/* learning: line actions */
+.line{position:relative}
+.la{position:absolute;top:8px;right:4px;display:flex;flex-direction:column;gap:4px;opacity:0;transition:opacity .2s}
+.line:hover .la,.line.active .la{opacity:1}
+.la button{padding:5px 7px;font-size:13px;background:rgba(255,255,255,.07)}
+.la .star.saved{color:var(--accent);opacity:1}
+.line .la:has(.saved){opacity:1}
+.he .w{border-radius:5px;padding:0 1px}
+/* word breakdown */
+.wb-head{padding:6px 10px 10px;border-bottom:1px solid var(--faint);margin-bottom:6px}
+.wb-head .he{font-size:22px;text-align:center}
+.wb-head .en{font-size:14px;text-align:center}
+.wrow{display:grid;grid-template-columns:1fr 1.4fr;gap:2px 14px;padding:9px 10px;border-radius:9px;align-items:baseline}
+.wrow:hover{background:rgba(255,255,255,.05)}
+.wrow .wh{direction:rtl;text-align:right;font-size:20px;font-weight:700;grid-row:span 2}
+.wrow .wm{font-size:15px;color:var(--en)}
+.wrow .wt{font-size:13px;color:var(--tr);font-style:italic}
+.wrow .wn{grid-column:2;font-size:12px;color:var(--dim)}
+/* review */
+#deckbtn{position:relative}
+#deckbtn .badge{position:absolute;top:-5px;right:-5px;background:var(--accent);color:#111;font-size:10px;font-weight:800;
+  border-radius:9px;padding:2px 5px;min-width:16px;text-align:center}
+#review{position:fixed;inset:0;z-index:6;background:rgba(10,9,14,.94);backdrop-filter:blur(18px);display:none;
+  flex-direction:column;align-items:center;padding:18px;overflow:auto}
+#review.open{display:flex}
+#review .top{width:100%;max-width:640px;display:flex;align-items:center;gap:10px;font-size:13px;color:var(--dim)}
+#review .top .grow{flex:1}
+#review .card{flex:1;width:100%;max-width:640px;display:flex;flex-direction:column;justify-content:center;align-items:center;
+  text-align:center;gap:14px;padding:20px 0}
+#review .song{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--dim)}
+#review .song img{width:34px;height:34px;border-radius:5px;object-fit:cover}
+#review .card .he{font-size:calc(34px*var(--size))}
+#review .ans{min-height:90px}
+#review .ans.hidden{visibility:hidden}
+#review .row{display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+#review .row button{padding:11px 18px;font-size:15px;border-radius:10px}
+#review .again{background:rgba(255,120,120,.16)}
+#review .good{background:rgba(140,230,160,.18)}
+#review kbd{font:inherit;font-size:11px;opacity:.55;margin-left:6px}
+#review .list{width:100%;max-width:640px;margin-top:10px}
+#review .item{display:flex;gap:10px;align-items:center;padding:9px 10px;border-radius:9px}
+#review .item:hover{background:rgba(255,255,255,.05)}
+#review .item .txt{flex:1;min-width:0}
+#review .item .ih{direction:rtl;font-weight:700;font-size:16px}
+#review .item .ie{font-size:13px;color:var(--dim)}
+#review .dots{font-size:11px;color:var(--accent);letter-spacing:2px}
 </style></head>
 <body>
 <div id="bg"></div><div id="progress"></div>
@@ -770,8 +1002,10 @@ footer a{color:var(--dim);cursor:pointer;text-decoration:underline}
 <main id="lyrics"></main>
 <div id="msg"></div>
 <div id="picker"></div>
+<div id="review"></div>
 <footer>
   <div class="grow" id="source"></div>
+  <button id="deckbtn" onclick="openReview()" title="Your deck: review saved lines (d)">★ Deck</button>
   <button id="t-he" title="Hebrew">עב</button>
   <button id="t-tr" title="Transliteration">abc</button>
   <button id="t-en" title="English">EN</button>
@@ -837,7 +1071,11 @@ function render(){
       d.className='line';
       const shaky=l.ok!==undefined&&l.ok<0.4;
       d.innerHTML=`<div class="he">${esc(l.he)}</div>`+(l.tr?`<div class="tr">${esc(l.tr)}</div>`:'')+
-        (l.en&&l.en!==l.he?`<div class="en${shaky?' shaky':''}" ${shaky?'title="Jev thinks this translation may be off"':''}>${esc(l.en)}</div>`:'');
+        (l.en&&l.en!==l.he?`<div class="en${shaky?' shaky':''}" ${shaky?'title="Jev thinks this translation may be off"':''}>${esc(l.en)}</div>`:'')+
+        (/[֐-׿]/.test(l.he)?`<div class="la"><button class="star${saved.has(cardKey(l.he))?' saved':''}" title="Save to your deck (s)">${saved.has(cardKey(l.he))?'★':'☆'}</button><button class="wbtn" title="Word by word (w)">אב</button></div>`:'');
+      const st=d.querySelector('.star'),wb=d.querySelector('.wbtn');
+      if(st)st.onclick=e=>{e.stopPropagation();toggleSave(i)};
+      if(wb)wb.onclick=e=>{e.stopPropagation();openWords(i)};
       if(l.t!=null)d.onclick=()=>ctl('seek',Math.max(0,l.t-0.3));
     }
     L.appendChild(d);lineEls.push(d);
@@ -867,6 +1105,85 @@ async function sendPaste(){
 }
 function pick(id){$('#picker').classList.remove('open');$('#lyrics').innerHTML='';loadLyrics('?pick='+id)}
 
+// ---------------------------------------------------------------- learning: deck + word breakdown
+let deck={cards:[],due:[],total:0},saved=new Map(),queue=[],cur=null,revealed=false,songFor={};
+const cardKey=he=>(trackId||'')+'\n'+he;
+async function post(url,body){const r=await fetch(url,{method:'POST',body:JSON.stringify(body)});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j}
+async function loadDeck(){
+  try{deck=await (await fetch('/api/deck')).json()}catch(e){return}
+  saved=new Map(deck.cards.map(c=>[c.track.id+'\n'+c.he,c.id]));
+  const n=deck.due.length;$('#deckbtn').innerHTML='★ Deck'+(n?`<span class="badge">${n}</span>`:'');
+}
+function lineEnd(i){const t=data.lines[i].t;if(t==null)return null;
+  for(let j=i+1;j<data.lines.length;j++){const u=data.lines[j].t;if(u!=null&&u>t)return u}return Math.min(t+6,now?now.duration:t+6)}
+function setStar(i,on){const s=lineEls[i]&&lineEls[i].querySelector('.star');if(s){s.classList.toggle('saved',on);s.textContent=on?'★':'☆'}}
+async function toggleSave(i){
+  const l=data.lines[i];if(!l||!l.he||!now)return;const k=cardKey(l.he);
+  if(saved.has(k)){await post('/api/deck/remove',{id:saved.get(k)});setStar(i,false)}
+  else{await post('/api/deck/add',{he:l.he,tr:l.tr||'',en:l.en||'',t:l.t,end:lineEnd(i),
+    track:{id:now.id,title:now.title,artist:now.artist,artwork:now.artwork||''}});setStar(i,true)}
+  loadDeck();
+}
+async function openWords(i,line){
+  const l=line||data.lines[i];if(!l||!l.he)return;const p=$('#picker');
+  p.innerHTML=`<div class="wb-head"><div class="he">${esc(l.he)}</div>${l.en?`<div class="en">${esc(l.en)}</div>`:''}</div><div id="wlist"><div style="display:flex;justify-content:center;padding:20px"><div class="spin"></div></div></div>`;
+  p.classList.add('open');
+  try{const r=await post('/api/words',{he:l.he,en:l.en||'',song:line?'':(now?now.title+' — '+now.artist:'')});
+    $('#wlist').innerHTML=r.words.map(w=>`<div class="wrow"><div class="wh">${esc(w.he)}</div><div><span class="wm">${esc(w.en)}</span> <span class="wt">${esc(w.tr)}</span></div>`+
+      `<div class="wn">${w.base&&w.base!==w.he?`from <b style="direction:rtl;unicode-bidi:isolate">${esc(w.base)}</b>`:''}${w.base&&w.base!==w.he&&w.note?' · ':''}<bdi>${esc(w.note)}</bdi></div></div>`).join('')}
+  catch(e){$('#wlist').innerHTML=`<div style="padding:16px;color:var(--dim);text-align:center">${esc(e.message)}</div>`}
+}
+
+// review: each card replays its line from the real song in Spotify, then pauses
+const isOpen=()=>$('#review').classList.contains('open');
+async function openReview(){await loadDeck();queue=[...deck.due];$('#picker').classList.remove('open');$('#review').classList.add('open');nextCard()}
+function closeReview(){$('#review').classList.remove('open');cur=null;loadDeck()}
+function nextCard(){
+  const byId=Object.fromEntries(deck.cards.map(c=>[c.id,c]));
+  while(queue.length&&!byId[queue[0]])queue.shift();
+  cur=queue.length?byId[queue[0]]:null;revealed=false;renderReview();
+  if(cur)hear();
+}
+function hear(){if(cur&&cur.t!=null)post('/api/playline',{uri:cur.track.id,t:cur.t,end:cur.end}).catch(e=>{const h=$('#hearerr');if(h)h.textContent=e.message})}
+function reveal(){if(!cur)return;revealed=true;renderReview()}
+async function grade(good){
+  if(!cur||!revealed)return;const id=cur.id;queue.shift();
+  if(!good)queue.push(id);  // missed: comes back at the end of this session
+  await post('/api/deck/grade',{id,good});await loadDeck();nextCard();
+}
+function fmtIn(s){if(s==null)return'';if(s<3600)return Math.max(1,Math.round(s/60))+' min';if(s<86400*1.5)return Math.round(s/3600)+' h';return Math.round(s/86400)+' days'}
+function renderReview(){
+  const R=$('#review'),left=queue.length;
+  const top=`<div class="top"><div class="grow">${cur?`Review · ${left} to go`:'Your deck'} · ${deck.total} lines · ${deck.learned} learned</div><button onclick="closeReview()" title="Close (Esc)">✕</button></div>`;
+  if(cur){
+    const c=cur;
+    R.innerHTML=top+`<div class="card">
+      <div class="song">${c.track.artwork?`<img src="${esc(c.track.artwork)}" alt="">`:''}<span>${esc(c.track.title)} — ${esc(c.track.artist)}</span></div>
+      <div class="he">${esc(c.he)}</div>
+      <div class="ans ${revealed?'':'hidden'}">${c.tr?`<div class="tr">${esc(c.tr)}</div>`:''}<div class="en">${esc(c.en)}</div>
+        <div style="margin-top:10px"><a class="btn" style="cursor:pointer" onclick='openWords(0,${JSON.stringify({he:c.he,en:c.en}).replace(/'/g,"&#39;")})'>word by word</a></div></div>
+      <div class="row">${c.t!=null?`<button onclick="hear()">▶ Hear it again<kbd>space</kbd></button>`:''}
+        ${revealed?`<button class="again" onclick="grade(false)">Again<kbd>1</kbd></button><button class="good" onclick="grade(true)">Got it<kbd>2</kbd></button>`
+                  :`<button class="on" onclick="reveal()">Show meaning<kbd>enter</kbd></button>`}</div>
+      <div id="hearerr" style="font-size:12px;color:var(--dim)"></div>
+      <div style="font-size:12px;color:var(--dim)">Say what it means out loud, then check.</div></div>`;
+    return;
+  }
+  const items=deck.cards.slice().sort((a,b)=>b.added-a.added).map(c=>`<div class="item">
+      ${c.t!=null?`<button onclick='post("/api/playline",${JSON.stringify({uri:c.track.id,t:c.t,end:c.end}).replace(/'/g,"&#39;")})' title="Play this line">▶</button>`:''}
+      <div class="txt"><div class="ih">${esc(c.he)}</div><div class="ie">${esc(c.en)} · ${esc(c.track.title)}</div></div>
+      <span class="dots" title="box ${c.box}">${'●'.repeat(c.box)}${'○'.repeat(6-c.box)}</span>
+      <button onclick="removeCard('${c.id}')" title="Remove">✕</button></div>`).join('');
+  R.innerHTML=top+`<div class="card" style="flex:none;padding-top:8vh">
+    <div class="big" style="font-size:24px;font-weight:700">${deck.total?'All caught up ✓':'Your deck is empty'}</div>
+    <div style="color:var(--dim);font-size:14px;max-width:420px;line-height:1.5">${deck.total
+      ?(deck.next_due_in!=null?`Next review in ${fmtIn(deck.next_due_in)}. `:'')+'Keep listening and tap ☆ on lines you want to remember.'
+      :'While a song plays, tap ☆ next to a line (or press <b>s</b>) to save it. Shir brings it back on a schedule and plays that exact line from the song so you can learn it by ear.'}</div></div>
+    <div class="list">${items}</div>`;
+}
+async function removeCard(id){await post('/api/deck/remove',{id});await loadDeck();if(data&&data.status==='ok')render();renderReview()}
+loadDeck();setInterval(loadDeck,60000);
+
 $('#lyrics').addEventListener('wheel',()=>userScrollUntil=performance.now()+4000,{passive:true});
 $('#lyrics').addEventListener('touchmove',()=>userScrollUntil=performance.now()+4000,{passive:true});
 function tick(){
@@ -885,7 +1202,12 @@ function tick(){
 poll();setInterval(poll,1000);requestAnimationFrame(tick);
 fetch('/api/status').then(r=>r.json()).then(s=>{if(!s.translation)console.log('No DeepSeek key: showing Hebrew only')});
 document.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA')return;
-  if(e.key===' '){e.preventDefault();ctl('playpause')}else if(e.key==='ArrowRight')ctl('next');else if(e.key==='ArrowLeft')ctl('previous');
+  if(e.key==='Escape'){if($('#picker').classList.contains('open'))$('#picker').classList.remove('open');else if(isOpen())closeReview();return}
+  if(isOpen()){if($('#picker').classList.contains('open'))return;
+    if(e.key===' '){e.preventDefault();hear()}else if(e.key==='Enter'){e.preventDefault();reveal()}
+    else if(e.key==='1')grade(false);else if(e.key==='2')grade(true);return}
+  if(e.key==='s'&&active>=0)toggleSave(active);else if(e.key==='w'&&active>=0)openWords(active);else if(e.key==='d')openReview();
+  else if(e.key===' '){e.preventDefault();ctl('playpause')}else if(e.key==='ArrowRight')ctl('next');else if(e.key==='ArrowLeft')ctl('previous');
   else if(e.key==='e')$('#t-en').click();else if(e.key==='t')$('#t-tr').click();else if(e.key==='h')$('#t-he').click()});
 </script></body></html>"""
 
