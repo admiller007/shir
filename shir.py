@@ -134,12 +134,10 @@ class SpotifyPlayer:
         }
 
     def control(self, action, value=None):
-        cmds = {
-            "seek": f"set player position to {float(value):.2f}",
-            "playpause": "playpause", "next": "next track", "previous": "previous track",
-            "pause": "pause",
-        }
-        if action in cmds:
+        cmds = {"playpause": "playpause", "next": "next track", "previous": "previous track", "pause": "pause"}
+        if action == "seek":  # only seek carries a value; formatting it eagerly broke every other button
+            osa(f'tell application "Spotify" to set player position to {float(value):.2f}')
+        elif action in cmds:
             osa(f'tell application "Spotify" to {cmds[action]}')
 
     def play_at(self, uri, start):
